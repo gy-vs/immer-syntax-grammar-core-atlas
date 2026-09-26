@@ -62,14 +62,21 @@ export function original(value: Drafted<any>): any {
 
 export function each<T extends Objectish>(
 	obj: T,
-	iter: (key: string | number, value: any, source: T) => void,
+	iter: (key: PropertyKey, value: any, source: T) => void,
 	enumerableOnly?: boolean
 ): void
-export function each(obj: any, iter: any) {
+export function each(obj: any, iter: any, enumerableOnly = false) {
 	if (getArchtype(obj) === ArchType.Object) {
-		Object.entries(obj).forEach(([key, value]) => {
-			iter(key, value, obj)
-		})
+		// By default we iterate all own keys, so that Symbol-keyed and
+		// non-enumerable child drafts are still reached during finalization.
+		// When `enumerableOnly` is set, we only visit enumerable string keys,
+		// matching `Object.entries`; this is used by deep freezing and when
+		// scanning plain (non-drafted) objects, see #590.
+		const keys = enumerableOnly ? Object.keys(obj) : Reflect.ownKeys(obj)
+		for (let i = 0; i < keys.length; i++) {
+			const key = keys[i]
+			iter(key, obj[key], obj)
+		}
 	} else {
 		obj.forEach((entry: any, index: any) => iter(index, entry, obj))
 	}
@@ -94,6 +101,20 @@ export function has(thing: any, prop: PropertyKey): boolean {
 	return getArchtype(thing) === ArchType.Map
 		? thing.has(prop)
 		: Object.prototype.hasOwnProperty.call(thing, prop)
+}
+
+/**
+ * Returns true for properties that are visited during deep freezing. Only plain
+ * objects exclude Symbol-keyed and non-enumerable own properties, so auto-freeze
+ * never recurses into them (see #590); array indices and Map/Set entries are
+ * always considered eligible.
+ */
+/*#__PURE__*/
+export function isEnumerableKey(thing: any, prop: PropertyKey): boolean {
+	if (typeof prop === "symbol") return false
+	const archtype = getArchtype(thing)
+	if (archtype !== ArchType.Object) return true
+	return !!Object.getOwnPropertyDescriptor(thing, prop)?.enumerable
 }
 
 /*#__PURE__*/

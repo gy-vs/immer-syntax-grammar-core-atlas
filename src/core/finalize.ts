@@ -15,7 +15,8 @@ import {
 	getPlugin,
 	die,
 	revokeScope,
-	isFrozen
+	isFrozen,
+	isEnumerableKey
 } from "../internal"
 
 export function processResult(result: any, scope: ImmerScope) {
@@ -51,18 +52,35 @@ export function processResult(result: any, scope: ImmerScope) {
 	return result !== NOTHING ? result : undefined
 }
 
-function finalize(rootScope: ImmerScope, value: any, path?: PatchPath) {
+function finalize(
+	rootScope: ImmerScope,
+	value: any,
+	path?: PatchPath,
+	canFreeze: boolean = true
+) {
 	// Don't recurse in tho recursive data structures
 	if (isFrozen(value)) return value
 
 	const state: ImmerState = value[DRAFT_STATE]
 	// A plain object, might need freezing, might contain drafts
 	if (!state) {
-		each(
-			value,
-			(key, childValue) =>
-				finalizeProperty(rootScope, state, value, key, childValue, path),
-			true // See #590, don't recurse into non-enumerable of non drafted objects
+		// Iterate all own keys, so that drafts referenced through Symbol or
+		// non-enumerable properties (e.g. a returned replacement result) are
+		// finalized as well. Freezing is still restricted to enumerable string
+		// keys, enforced per property below, see #590.
+		each(value, (key, childValue) =>
+			finalizeProperty(
+				rootScope,
+				state,
+				value,
+				key,
+				childValue,
+				path,
+				false,
+				// Freezing only continues along enumerable string keys, and never
+				// re-enters a Symbol/non-enumerable subtree we already excluded.
+				canFreeze && isEnumerableKey(value, key)
+			)
 		)
 		return value
 	}
@@ -70,7 +88,7 @@ function finalize(rootScope: ImmerScope, value: any, path?: PatchPath) {
 	if (state.scope_ !== rootScope) return value
 	// Unmodified draft, return the (frozen) original
 	if (!state.modified_) {
-		maybeFreeze(rootScope, state.base_, true)
+		if (canFreeze) maybeFreeze(rootScope, state.base_, true)
 		return state.base_
 	}
 	// Not finalized yet, let's do that now
@@ -90,10 +108,23 @@ function finalize(rootScope: ImmerScope, value: any, path?: PatchPath) {
 			isSet = true
 		}
 		each(resultEach, (key, childValue) =>
-			finalizeProperty(rootScope, state, result, key, childValue, path, isSet)
+			finalizeProperty(
+				rootScope,
+				state,
+				result,
+				key,
+				childValue,
+				path,
+				isSet,
+				// Symbol-keyed and non-enumerable child drafts are still finalized,
+				// but auto-freeze must not recurse into them, see #590.
+				// The flag accumulates down the tree: once excluded, descendants
+				// stay excluded even through enumerable keys.
+				canFreeze && isEnumerableKey(result, key)
+			)
 		)
 		// everything inside is frozen, we can freeze here
-		maybeFreeze(rootScope, result, false)
+		if (canFreeze) maybeFreeze(rootScope, result, false)
 		// first time finalizing, let's create those patches
 		if (path && rootScope.patches_) {
 			getPlugin("Patches").generatePatches_(
@@ -111,10 +142,11 @@ function finalizeProperty(
 	rootScope: ImmerScope,
 	parentState: undefined | ImmerState,
 	targetObject: any,
-	prop: string | number,
+	prop: PropertyKey,
 	childValue: any,
 	rootPath?: PatchPath,
-	targetIsSet?: boolean
+	targetIsSet?: boolean,
+	canFreeze: boolean = true
 ) {
 	if (process.env.NODE_ENV !== "production" && childValue === targetObject)
 		die(5)
@@ -123,11 +155,14 @@ function finalizeProperty(
 			rootPath &&
 			parentState &&
 			parentState!.type_ !== ArchType.Set && // Set objects are atomic since they have no keys.
+			typeof prop !== "symbol" && // JSON Patch paths cannot address Symbol keys.
 			!has((parentState as Exclude<ImmerState, SetState>).assigned_!, prop) // Skip deep patches for assigned keys.
-				? rootPath!.concat(prop)
+				? rootPath!.concat(prop as string | number)
 				: undefined
 		// Drafts owned by `scope` are finalized here.
-		const res = finalize(rootScope, childValue, path)
+		// `canFreeze` propagates: a reachable but Symbol/non-enumerable owned
+		// draft is unwrapped, yet its subtree is never deep frozen.
+		const res = finalize(rootScope, childValue, path, canFreeze)
 		set(targetObject, prop, res)
 		// Drafts from another scope must prevented to be frozen
 		// if we got a draft back from finalize, we're in a nested produce and shouldn't freeze
@@ -147,9 +182,10 @@ function finalizeProperty(
 			// See add-data.js perf test
 			return
 		}
-		finalize(rootScope, childValue)
+		finalize(rootScope, childValue, undefined, canFreeze)
 		// immer deep freezes plain objects, so if there is no parent state, we freeze as well
-		if (!parentState || !parentState.scope_.parent_)
+		// Symbol/non-enumerable subtrees are excluded from freezing, see #590.
+		if (canFreeze && (!parentState || !parentState.scope_.parent_))
 			maybeFreeze(rootScope, childValue)
 	}
 }

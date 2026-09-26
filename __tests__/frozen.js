@@ -4,7 +4,8 @@ import {
 	setUseProxies,
 	setAutoFreeze,
 	freeze,
-	enableMapSet
+	enableMapSet,
+	Immer
 } from "../src/immer"
 
 enableMapSet()
@@ -243,6 +244,77 @@ function runTests(name) {
 				state2.ref[symbol].x++
 			}).not.toThrow()
 			expect(state2.ref[symbol].x).toBe(2)
+		})
+
+		it("finalizes Symbol-keyed child drafts instead of leaving revoked proxies", () => {
+			const symbol = Symbol("test")
+			const base = {id: 1, [symbol]: {x: 1}}
+			const next = produce(base, draft => {
+				// merely reading the Symbol child creates a child draft
+				expect(draft[symbol].x).toBe(1)
+			})
+			// the result must not retain a revoked proxy under the Symbol key
+			expect(next[symbol].x).toBe(1)
+			// the resolved value can be drafted again by a subsequent produce
+			const next2 = produce(next, draft => {
+				draft[symbol].x = 2
+			})
+			expect(next2[symbol].x).toBe(2)
+			// auto-freeze still does not recurse through the Symbol key
+			expect(isFrozen(next)).toBeTruthy()
+			expect(isFrozen(next[symbol])).toBeFalsy()
+			expect(isFrozen(next2[symbol])).toBeFalsy()
+		})
+
+		it("finalizes modified Symbol-keyed drafts without freezing their subtree", () => {
+			const symbol = Symbol("test")
+			const next = produce({id: 1, [symbol]: {a: {b: 1}}}, draft => {
+				draft[symbol].a.b = 2
+			})
+			expect(next[symbol].a.b).toBe(2)
+			expect(isFrozen(next[symbol])).toBeFalsy()
+			expect(isFrozen(next[symbol].a)).toBeFalsy()
+			// enumerable siblings are still deep frozen
+			expect(isFrozen(next)).toBeTruthy()
+		})
+
+		it("finalizes non-enumerable child drafts without freezing them", () => {
+			const strictImmer = new Immer({useStrictShallowCopy: true})
+			const base = {}
+			Object.defineProperty(base, "hidden", {
+				value: {x: {y: 1}},
+				enumerable: false,
+				writable: true,
+				configurable: true
+			})
+			const next = strictImmer.produce(base, draft => {
+				draft.hidden.x.y = 2
+			})
+			expect(next.hidden.x.y).toBe(2)
+			expect(
+				Object.getOwnPropertyDescriptor(next, "hidden").enumerable
+			).toBeFalsy()
+			expect(isFrozen(next)).toBeTruthy()
+			expect(isFrozen(next.hidden)).toBeFalsy()
+			expect(isFrozen(next.hidden.x)).toBeFalsy()
+			// still resolvable in a subsequent produce
+			const next2 = strictImmer.produce(next, draft => {
+				draft.hidden.x.y = 3
+			})
+			expect(next2.hidden.x.y).toBe(3)
+		})
+
+		it("finalizes Symbol-referenced drafts in a returned replacement", () => {
+			const symbol = Symbol("test")
+			const next = produce({a: {x: 1}}, draft => {
+				return {[symbol]: draft.a}
+			})
+			expect(next[symbol].x).toBe(1)
+			expect(isFrozen(next[symbol])).toBeFalsy()
+			const next2 = produce(next, draft => {
+				draft[symbol].x = 2
+			})
+			expect(next2[symbol].x).toBe(2)
 		})
 	})
 }
